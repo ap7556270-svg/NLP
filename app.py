@@ -13,29 +13,37 @@ import matplotlib.pyplot as plt
 import io
 import logging
 from typing import Optional, Tuple, List
-import requests
 import os
-from dotenv import load_dotenv
+from ftfy import fix_text
 
-load_dotenv()
-API_KEY = os.getenv("GOOGLE_FACTCHECK_API_KEY")
+API_KEY = st.secrets["GOOGLE_FACTCHECK_API_KEY"]
 
+# ---------------------------
+# Small cleaner using ftfy + whitespace collapse
+# ---------------------------
+def clean(s: Optional[str]) -> Optional[str]:
+    if s is None:
+        return None
+    try:
+        s = fix_text(s)
+    except Exception:
+        pass
+    return " ".join(s.split()).strip()
 
-#Define a Function to Query Google Fact Check
+# ---------------------------
+# Google Fact Check
+# ---------------------------
 def get_fact_check_results(query):
     """Fetch fact-check results for the given query from Google Fact Check Tools API."""
     if not API_KEY:
         return []
-    
     url = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
     params = {"query": query, "key": API_KEY}
-    
     try:
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=15)
         response.raise_for_status()
         data = response.json()
         claims = data.get("claims", [])
-        
         results = []
         for claim in claims:
             reviews = claim.get("claimReview", [])
@@ -47,11 +55,8 @@ def get_fact_check_results(query):
                     "url": r.get("url", "")
                 })
         return results
-    
     except Exception as e:
         return [{"publisher": "Error", "title": str(e), "rating": "", "url": ""}]
-
-
 
 # Imbalanced learn
 from imblearn.over_sampling import SMOTE
@@ -68,9 +73,6 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import LabelEncoder
-from sklearn.exceptions import NotFittedError
 
 # ---------------------------
 # CONFIG
@@ -86,7 +88,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------------------
-# SPAcy loader (cached)
+# SpaCy loader (cached)
 # ---------------------------
 @st.cache_resource
 def load_spacy_model():
@@ -102,18 +104,16 @@ imbalanced-learn
         """, language="text")
         raise e
 
-NLP_MODEL = None
 try:
     NLP_MODEL = load_spacy_model()
 except Exception:
-    # stop app gracefully if model not available
     st.stop()
 
 stop_words = STOP_WORDS
 pragmatic_words = ["must", "should", "might", "could", "will", "?", "!"]
 
 # ---------------------------
-# UTIL: robust requests with retries
+# Robust GET with retries
 # ---------------------------
 def safe_get(url: str, timeout: int = 15) -> Optional[requests.Response]:
     backoff = REQUEST_BACKOFF
@@ -129,9 +129,9 @@ def safe_get(url: str, timeout: int = 15) -> Optional[requests.Response]:
     return None
 
 # ---------------------------
-# 1. SCRAPER (improved)
+# 1) SCRAPER with ftfy cleaning
 # ---------------------------
-@st.cache_data(ttl=60*60*24)  # cache scraped results for a day for same args
+@st.cache_data(ttl=60*60*24)  # cache for a day per arg set
 def scrape_data_by_date_range(start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
     base_url = "https://www.politifact.com/factchecks/list/"
     current_url = base_url
@@ -151,8 +151,13 @@ def scrape_data_by_date_range(start_date: pd.Timestamp, end_date: pd.Timestamp) 
             st.warning(f"Failed to fetch {current_url} after retries; stopping scraper.")
             break
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        # ⚠️ Ensure correct decoding before parsing
+        try:
+            resp.encoding = resp.apparent_encoding
+        except Exception:
+            pass
 
+        soup = BeautifulSoup(resp.text, "html.parser")
         items = soup.find_all("li", class_="o-listicle__item")
         if not items:
             logger.info("No items found on page; stopping.")
@@ -160,7 +165,7 @@ def scrape_data_by_date_range(start_date: pd.Timestamp, end_date: pd.Timestamp) 
 
         stop_if_older = False
         for card in items:
-            # date extraction: fallback robust parsing
+            # date extraction
             date_div = card.find("div", class_="m-statement__desc")
             date_text = date_div.get_text(" ", strip=True) if date_div else ""
             claim_date = None
@@ -170,17 +175,11 @@ def scrape_data_by_date_range(start_date: pd.Timestamp, end_date: pd.Timestamp) 
                     try:
                         claim_date = pd.to_datetime(match.group(1), format="%B %d, %Y")
                     except Exception:
-                        # try pandas flexible parse
-                        try:
-                            claim_date = pd.to_datetime(match.group(1), errors='coerce')
-                        except Exception:
-                            claim_date = None
+                        claim_date = pd.to_datetime(match.group(1), errors='coerce')
 
-            # if date still not found, skip
             if claim_date is None:
                 continue
 
-            # stop condition
             if claim_date < start_date:
                 stop_if_older = True
                 break
@@ -189,39 +188,37 @@ def scrape_data_by_date_range(start_date: pd.Timestamp, end_date: pd.Timestamp) 
                 continue
 
             # statement
-            statement_block = card.find("div", class_="m-statement__quote")
             statement = None
+            statement_block = card.find("div", class_="m-statement__quote")
             if statement_block:
                 a = statement_block.find("a", href=True)
                 if a:
-                    statement = a.get_text(" ", strip=True)
+                    statement = clean(a.get_text(" ", strip=True))
 
             # source / speaker
             source = None
             source_a = card.find("a", class_="m-statement__name")
             if source_a:
-                source = source_a.get_text(" ", strip=True)
+                source = clean(source_a.get_text(" ", strip=True))
 
             # author
-            footer = card.find("footer", class_="m-statement__footer")
             author = None
+            footer = card.find("footer", class_="m-statement__footer")
             if footer:
-                # patterns vary; try multiple heuristics
                 text = footer.get_text(" ", strip=True)
                 m = re.search(r"By\s+([^•\n\r]+)", text)
                 if m:
-                    author = m.group(1).strip()
+                    author = clean(m.group(1).strip())
                 else:
-                    # fallback: take first token group
                     parts = text.split("•")
                     if parts:
-                        author = parts[0].replace("By", "").strip()
+                        author = clean(parts[0].replace("By", "").strip())
 
             # label
-            label_img = card.find("img", alt=True)
             label = None
+            label_img = card.find("img", alt=True)
             if label_img and 'alt' in label_img.attrs:
-                label = label_img['alt'].replace('-', ' ').title()
+                label = clean(label_img['alt'].replace('-', ' ').title())
 
             rows.append({
                 "author": author,
@@ -234,27 +231,23 @@ def scrape_data_by_date_range(start_date: pd.Timestamp, end_date: pd.Timestamp) 
         if stop_if_older:
             break
 
-        # find next
+        # next page
         next_link = soup.find("a", class_="c-button c-button--hollow", string=re.compile(r"Next", re.I))
         if next_link and next_link.get("href"):
-            next_href = next_link['href']
-            current_url = urljoin(base_url, next_href)
+            current_url = urljoin(base_url, next_link['href'])
         else:
             break
 
     df = pd.DataFrame(rows)
-    # basic cleaning
     df = df.dropna(subset=["statement", "label"])
-    # save to csv for convenience
     if not df.empty:
         df.to_csv(SCRAPED_DATA_PATH, index=False)
     return df
 
 # ---------------------------
-# 2. FEATURE FUNCTIONS (batch-friendly)
+# 2) Feature functions (batch)
 # ---------------------------
 def lexical_features_batch(texts: List[str], nlp) -> List[str]:
-    # batch process with spaCy pipes for speed
     processed = []
     for doc in nlp.pipe(texts, disable=["ner", "parser"]):
         toks = [token.lemma_.lower() for token in doc if token.is_alpha and token.lemma_.lower() not in stop_words]
@@ -279,7 +272,6 @@ def discourse_features_batch(texts: List[str], nlp) -> List[str]:
     processed = []
     for doc in nlp.pipe(texts, disable=["ner"]):
         sents = [sent.text.strip() for sent in doc.sents]
-        # return "num_sentences first_words"
         first_words = " ".join([s.split()[0].lower() for s in sents if len(s.split()) > 0])
         processed.append(f"{len(sents)} {first_words}")
     return processed
@@ -292,7 +284,7 @@ def pragmatic_features_batch(texts: List[str]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=pragmatic_words)
 
 # ---------------------------
-# 3. Feature extraction dispatcher
+# 3) Feature extraction dispatcher
 # ---------------------------
 def apply_feature_extraction(X_series: pd.Series, phase: str, nlp) -> Tuple[np.ndarray, Optional[object]]:
     X_texts = X_series.astype(str).tolist()
@@ -309,7 +301,7 @@ def apply_feature_extraction(X_series: pd.Series, phase: str, nlp) -> Tuple[np.n
         return X_feat, vect
 
     if phase == "Semantic":
-        df = semantic_features_batch(X_texts)  # DataFrame
+        df = semantic_features_batch(X_texts)
         return df.values, None
 
     if phase == "Discourse":
@@ -325,7 +317,7 @@ def apply_feature_extraction(X_series: pd.Series, phase: str, nlp) -> Tuple[np.n
     raise ValueError("Unknown phase")
 
 # ---------------------------
-# 4. Model helpers & evaluate
+# 4) Model helpers & evaluation
 # ---------------------------
 def get_models_dict():
     return {
@@ -347,7 +339,6 @@ def create_binary_target(df: pd.DataFrame) -> pd.DataFrame:
             return 1
         if l in FAKE_LABELS:
             return 0
-        # fallback: try contains
         low = l.lower()
         if "true" in low and "mostly" not in low and "half" not in low:
             return 1
@@ -371,14 +362,12 @@ def evaluate_models(df: pd.DataFrame, selected_phase: str, nlp) -> pd.DataFrame:
         st.error("Only one class present after mapping — adjust data or date range.")
         return pd.DataFrame()
 
-    # extract features once
     X_features_full, vectorizer = apply_feature_extraction(X_raw, selected_phase, nlp)
 
-    # convert dense arrays to numpy
     if isinstance(X_features_full, np.ndarray):
         X_full = X_features_full
     else:
-        X_full = X_features_full  # sparse matrix is fine
+        X_full = X_features_full
 
     models = get_models_dict()
     results = []
@@ -388,73 +377,58 @@ def evaluate_models(df: pd.DataFrame, selected_phase: str, nlp) -> pd.DataFrame:
 
     for name, model in models.items():
         st.caption(f"Training {name}...")
-        fold_acc = []
-        fold_f1 = []
-        fold_prec = []
-        fold_rec = []
-        train_times = []
-        infer_times = []
+        fold_acc, fold_f1, fold_prec, fold_rec = [], [], [], []
+        train_times, infer_times = [], []
 
         for fold, (train_idx, test_idx) in enumerate(skf.split(np.zeros(len(y_raw)), y_raw)):
-            # build train/test from raw texts and y for consistent preprocessing per fold
             X_train_raw = pd.Series([X_list[i] for i in train_idx])
             X_test_raw = pd.Series([X_list[i] for i in test_idx])
             y_train = y_raw.values[train_idx]
             y_test = y_raw.values[test_idx]
 
-            # transform feature for this fold using overall vectorizer or per-phase logic
             if vectorizer is not None:
-                # the vectorizer was fitted on full dataset earlier; for per-fold we transform processed texts
                 if selected_phase == "Lexical & Morphological":
                     X_train_proc = lexical_features_batch(X_train_raw.tolist(), nlp)
-                    X_test_proc = lexical_features_batch(X_test_raw.tolist(), nlp)
+                    X_test_proc  = lexical_features_batch(X_test_raw.tolist(), nlp)
                 elif selected_phase == "Syntactic":
                     X_train_proc = syntactic_features_batch(X_train_raw.tolist(), nlp)
-                    X_test_proc = syntactic_features_batch(X_test_raw.tolist(), nlp)
+                    X_test_proc  = syntactic_features_batch(X_test_raw.tolist(), nlp)
                 elif selected_phase == "Discourse":
                     X_train_proc = discourse_features_batch(X_train_raw.tolist(), nlp)
-                    X_test_proc = discourse_features_batch(X_test_raw.tolist(), nlp)
+                    X_test_proc  = discourse_features_batch(X_test_raw.tolist(), nlp)
                 else:
-                    # fallback
                     X_train_proc = X_train_raw.tolist()
-                    X_test_proc = X_test_raw.tolist()
+                    X_test_proc  = X_test_raw.tolist()
 
                 X_train = vectorizer.transform(X_train_proc)
-                X_test = vectorizer.transform(X_test_proc)
+                X_test  = vectorizer.transform(X_test_proc)
             else:
-                # dense features
                 if selected_phase == "Semantic":
                     X_train = semantic_features_batch(X_train_raw.tolist()).values
-                    X_test = semantic_features_batch(X_test_raw.tolist()).values
+                    X_test  = semantic_features_batch(X_test_raw.tolist()).values
                 elif selected_phase == "Pragmatic":
                     X_train = pragmatic_features_batch(X_train_raw.tolist()).values
-                    X_test = pragmatic_features_batch(X_test_raw.tolist()).values
+                    X_test  = pragmatic_features_batch(X_test_raw.tolist()).values
                 else:
-                    # fallback to raw tfidf - unlikely
                     X_train = X_train_raw.values.reshape(-1, 1)
-                    X_test = X_test_raw.values.reshape(-1, 1)
+                    X_test  = X_test_raw.values.reshape(-1, 1)
 
             start_train = time.time()
             try:
                 if name == "Naive Bayes":
-                    # Naive Bayes expects non-negative features; use absolute if sparse
-                    Xt = X_train
-                    if hasattr(Xt, "toarray"):
-                        Xt_fit = np.abs(Xt).astype(float)
-                    else:
-                        Xt_fit = np.abs(Xt).astype(float)
+                    Xt_fit = np.abs(X_train).astype(float)
                     model.fit(Xt_fit, y_train)
                     clf = model
                 else:
                     pipeline = ImbPipeline([("smote", SMOTE(random_state=42, k_neighbors=3)), ("clf", model)])
-                    # ImbPipeline expects arrays / sparse matrices
                     pipeline.fit(X_train, y_train)
                     clf = pipeline
+
                 train_time = time.time() - start_train
                 start_inf = time.time()
                 y_pred = clf.predict(X_test)
                 infer_time = (time.time() - start_inf) * 1000.0
-                # metrics
+
                 fold_acc.append(accuracy_score(y_test, y_pred))
                 fold_f1.append(f1_score(y_test, y_pred, average="weighted", zero_division=0))
                 fold_prec.append(precision_score(y_test, y_pred, average="weighted", zero_division=0))
@@ -463,17 +437,10 @@ def evaluate_models(df: pd.DataFrame, selected_phase: str, nlp) -> pd.DataFrame:
                 infer_times.append(infer_time)
             except Exception as e:
                 st.warning(f"Fold {fold+1} failed for {name}: {e}")
-                # append zeros to keep shape
-                fold_acc.append(0)
-                fold_f1.append(0)
-                fold_prec.append(0)
-                fold_rec.append(0)
-                train_times.append(0)
-                infer_times.append(9999)
-                continue
+                fold_acc.append(0); fold_f1.append(0); fold_prec.append(0); fold_rec.append(0)
+                train_times.append(0); infer_times.append(9999)
 
-        # aggregate
-        result = {
+        results.append({
             "Model": name,
             "Accuracy": np.mean(fold_acc) * 100,
             "F1-Score": np.mean(fold_f1),
@@ -481,13 +448,12 @@ def evaluate_models(df: pd.DataFrame, selected_phase: str, nlp) -> pd.DataFrame:
             "Recall": np.mean(fold_rec),
             "Training Time (s)": round(np.mean(train_times), 3),
             "Inference Latency (ms)": round(np.mean(infer_times), 3)
-        }
-        results.append(result)
+        })
 
     return pd.DataFrame(results)
 
 # ---------------------------
-# 5. Critique & humor (keeps original flavor)
+# Humor & critique
 # ---------------------------
 def get_phase_critique(best_phase: str) -> str:
     critiques = {
@@ -511,7 +477,6 @@ def get_model_critique(best_model: str) -> str:
 def generate_humorous_critique(df_results: pd.DataFrame, selected_phase: str) -> str:
     if df_results.empty:
         return "The system failed to train anything. We apologize; our ML models are currently on strike demanding better data and less existential dread."
-
     df_results = df_results.copy()
     df_results['F1-Score'] = pd.to_numeric(df_results['F1-Score'], errors='coerce').fillna(0)
     best_idx = df_results['F1-Score'].idxmax()
@@ -519,29 +484,24 @@ def generate_humorous_critique(df_results: pd.DataFrame, selected_phase: str) ->
     best_model = best_model_row['Model']
     max_f1 = best_model_row['F1-Score']
     max_acc = best_model_row['Accuracy']
-
     phase_critique = get_phase_critique(selected_phase)
     model_critique = get_model_critique(best_model)
-
     headline = f"👑 The Golden Snitch Award goes to the {best_model}!"
-
     summary = (
         f"**Accuracy Report Card:** {headline}\n\n"
         f"This absolute unit achieved a **{max_acc:.2f}% Accuracy** (and {max_f1:.2f} F1-Score) on the `{selected_phase}` feature set. "
         f"It beat its rivals, proving that when faced with political statements, the winning strategy was to rely on: **{selected_phase} features!**\n\n"
     )
-
     roast = (
         f"### The AI Roast (Certified by a Data Scientist):\n"
         f"**Phase Performance:** {phase_critique}\n\n"
         f"**Model Personality:** {model_critique}\n\n"
         f"*(Disclaimer: All models were equally confused by the 'Mostly True' label, which they collectively deemed an existential threat.)*"
     )
-
     return summary + roast
 
 # ---------------------------
-# STREAMLIT APP UI (same layout as original, improved UX)
+# STREAMLIT APP UI
 # ---------------------------
 def app():
     st.set_page_config(page_title='AI vs. Fact: NLP Comparator', layout='wide')
@@ -638,11 +598,9 @@ def app():
             metrics = ['Accuracy','F1-Score','Precision','Recall','Training Time (s)','Inference Latency (ms)']
             plot_metric = st.selectbox("Metric to Plot:", metrics, index=1, key='plot_metric_center')
             df_plot = df_results[['Model', plot_metric]].set_index('Model')
-            # streamlit bar_chart accepts dataframe
             st.bar_chart(df_plot)
             st.caption(f"Chart shows each model's mean {plot_metric} across {N_SPLITS} folds.")
 
-            # CSV download
             csv_data = df_results.to_csv(index=False).encode('utf-8')
             st.download_button("Download Results CSV", csv_data, file_name="model_results.csv", mime="text/csv")
 
@@ -674,26 +632,23 @@ def app():
     # 🔍 SIDEBAR FACT CHECK TOOL
     # ---------------------------
     st.sidebar.subheader("🔍 Cross-Platform Fact Check")
-
     user_query = st.sidebar.text_input("Enter a claim or statement to fact-check:")
-
     if st.sidebar.button("Check Fact Credibility"):
         if not user_query.strip():
             st.sidebar.warning("Please enter a statement to check.")
         else:
             st.sidebar.info("Fetching verified fact-checks...")
             results = get_fact_check_results(user_query)
-
             if not results:
                 st.sidebar.warning("No verified fact-checks found for this claim.")
             else:
                 st.sidebar.success(f"Found {len(results)} fact-check result(s):")
-                for r in results[:5]:  # show top 5 only
+                for r in results[:5]:
                     st.sidebar.markdown(f"""
-                    **Source:** {r['publisher']}  
-                    **Verdict:** {r['rating']}  
-                    [{r['title']}]({r['url']})
-                    """)
+**Source:** {r['publisher']}  
+**Verdict:** {r['rating']}  
+[{r['title']}]({r['url']})
+""")
 
 if __name__ == "__main__":
     app()
